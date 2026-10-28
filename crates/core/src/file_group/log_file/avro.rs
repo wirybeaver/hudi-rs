@@ -174,9 +174,8 @@ impl AvroBlockDecoder {
 
     /// The Arrow schema decoded records will carry.
     ///
-    /// Taken from the decoder rather than converted from the Avro JSON, because
-    /// `avro_to_arrow` does not handle named-type references and the metadata
-    /// table's schema uses them. Dictionaries are unpacked to match what
+    /// Taken from the decoder rather than converted from the Avro JSON, to preserve the decoder's physical
+    /// types and metadata. Dictionaries are unpacked to match what
     /// [`flush`](Self::flush) emits.
     pub fn schema(&self) -> SchemaRef {
         let schema = self.decoder.schema();
@@ -741,5 +740,71 @@ mod variant_tests {
                 .value(0),
             Variant::from("iceberg")
         );
+    }
+    #[test]
+    fn test_variant_nested_nulls_survive_avro_decode_and_projection() {
+        use arrow::array::Array;
+        use arrow::array::AsArray;
+        let schema = AvroSchema::parse_str(r#"{
+          "type":"record","name":"root","fields":[
+            {"name":"v","type":["null",{"type":"record","name":"variant","logicalType":"variant","fields":[
+              {"name":"value","type":"bytes"},{"name":"metadata","type":"bytes"}]}]},
+            {"name":"items","type":{"type":"array","items":["null","variant"]}},
+            {"name":"attributes","type":{"type":"map","values":"variant"}}
+          ]}"#).unwrap();
+        let mut builder = VariantArrayBuilder::new(2);
+        builder.append_value(Variant::Null);
+        builder.append_value(42_i64);
+        let encoded = builder.build();
+        let value = |i| {
+            Value::Record(vec![
+                (
+                    "value".into(),
+                    Value::Bytes(encoded.value_column().as_binary_view().value(i).to_vec()),
+                ),
+                (
+                    "metadata".into(),
+                    Value::Bytes(encoded.metadata_column().as_binary_view().value(i).to_vec()),
+                ),
+            ])
+        };
+        let datum = Value::Record(vec![
+            ("v".into(), Value::Union(0, Box::new(Value::Null))),
+            (
+                "items".into(),
+                Value::Array(vec![
+                    Value::Union(0, Box::new(Value::Null)),
+                    Value::Union(1, Box::new(value(0))),
+                    Value::Union(1, Box::new(value(1))),
+                ]),
+            ),
+            (
+                "attributes".into(),
+                Value::Map(std::collections::HashMap::from([(
+                    "answer".into(),
+                    value(1),
+                )])),
+            ),
+        ]);
+        let batch = read_variant(&schema, datum);
+        assert!(batch.column_by_name("v").unwrap().is_null(0));
+        let items = batch
+            .column_by_name("items")
+            .unwrap()
+            .as_list::<i32>()
+            .value(0);
+        let variants = VariantArray::try_new(&items).unwrap();
+        assert!(variants.is_null(0));
+        assert!(!variants.is_null(1));
+        assert_eq!(variants.try_value(1).unwrap(), Variant::Null);
+        assert_eq!(variants.try_value(2).unwrap().as_int64(), Some(42));
+        let map = batch.column_by_name("attributes").unwrap().as_map();
+        let values = VariantArray::try_new(map.values()).unwrap();
+        assert_eq!(values.try_value(0).unwrap().as_int64(), Some(42));
+        // The C Data Interface is also the schema/array transport used by the bindings.
+        let array = arrow_array::StructArray::from(batch);
+        let (data, schema) = arrow::ffi::to_ffi(&array.to_data()).unwrap();
+        let imported = unsafe { arrow::ffi::from_ffi(data, &schema) }.unwrap();
+        assert_eq!(array.to_data(), imported);
     }
 }

@@ -407,6 +407,7 @@ impl HudiDataSource {
     /// [`HudiScanExec`].
     ///
     /// Routing matrix:
+    /// - Variant columns at any nesting depth → `HudiScanExec` (schema handling)
     /// - Parquet COW → `ParquetSource`
     /// - Parquet MOR read-optimized → `ParquetSource`
     /// - Parquet MOR snapshot → `HudiScanExec` (base + log merging)
@@ -416,6 +417,14 @@ impl HudiDataSource {
         read_options: &ReadOptions,
         file_slices: &[FileSlice],
     ) -> Result<bool> {
+        if self
+            .schema
+            .fields()
+            .iter()
+            .any(|f| hudi_core::schema::variant::contains_variant(f))
+        {
+            return Ok(false);
+        }
         let parquet_base_files = match &self.base_file_format {
             Some(format) => matches!(format, BaseFileFormatValue::Parquet),
             None => Self::file_slices_are_parquet(file_slices)?,
@@ -498,13 +507,15 @@ impl HudiDataSource {
             Expr::Between(between) => {
                 // BETWEEN can be pushed if expr is a column and bounds are literals
                 !between.negated
-                    && matches!(&*between.expr, Expr::Column(col) if schema.column_with_name(&col.name).is_some())
+                    && matches!(&*between.expr, Expr::Column(_))
+                    && Self::is_supported_operand(schema, &between.expr)
                     && matches!(&*between.low, Expr::Literal(..))
                     && matches!(&*between.high, Expr::Literal(..))
             }
             Expr::InList(in_list) => {
                 !in_list.list.is_empty()
-                    && matches!(in_list.expr.as_ref(), Expr::Column(col) if schema.column_with_name(&col.name).is_some())
+                    && matches!(in_list.expr.as_ref(), Expr::Column(_))
+                    && Self::is_supported_operand(schema, &in_list.expr)
                     && in_list
                         .list
                         .iter()
@@ -528,7 +539,9 @@ impl HudiDataSource {
 
     fn is_supported_operand(schema: &Schema, expr: &Expr) -> bool {
         match expr {
-            Expr::Column(col) => schema.column_with_name(&col.name).is_some(),
+            Expr::Column(col) => schema
+                .column_with_name(&col.name)
+                .is_some_and(|(_, f)| !hudi_core::schema::variant::contains_variant(f)),
             Expr::Literal(..) => true,
             _ => false,
         }
@@ -651,6 +664,16 @@ impl HudiDataSource {
         &self,
         read_options: &ReadOptions,
     ) -> Result<Option<bool>> {
+        // The native Parquet schema adapter can discard typed_value before Hudi
+        // can reject or reconstruct a shredded Variant.
+        if self
+            .schema
+            .fields()
+            .iter()
+            .any(|f| hudi_core::schema::variant::contains_variant(f))
+        {
+            return Ok(Some(false));
+        }
         if self.table.is_mor()
             && !read_options
                 .is_read_optimized()

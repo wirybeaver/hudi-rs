@@ -18,11 +18,12 @@
 use crate::error::{CoreError, Result};
 use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::{Alias, DecimalSchema, EnumSchema, FixedSchema, Name, RecordSchema};
+use apache_avro::schema::{NamesRef, ResolvedSchema};
 use apache_avro::types::Value;
 use arrow::datatypes::{DataType, IntervalUnit, Schema, TimeUnit, UnionMode};
 use arrow::datatypes::{Field, UnionFields};
 use parquet::variant::VariantType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Timezone an Avro `timestamp-*` logical type denotes, per the Avro spec.
@@ -32,11 +33,16 @@ const HUDI_VARIANT_LOGICAL_TYPE: &str = "variant";
 
 /// Converts an avro schema to an arrow schema
 pub fn to_arrow_schema(avro_schema: &apache_avro::Schema) -> Result<Schema> {
+    let resolved = ResolvedSchema::try_from(avro_schema)?;
+    let mut converter = SchemaConverter {
+        names: resolved.get_names(),
+        resolving: HashSet::new(),
+    };
     let mut schema_fields = vec![];
     match avro_schema {
         AvroSchema::Record(RecordSchema { fields, .. }) => {
             for field in fields {
-                schema_fields.push(schema_to_field_with_props(
+                schema_fields.push(converter.field(
                     &field.schema,
                     Some(&field.name),
                     field.is_nullable(),
@@ -44,155 +50,168 @@ pub fn to_arrow_schema(avro_schema: &apache_avro::Schema) -> Result<Schema> {
                 )?)
             }
         }
-        schema => schema_fields.push(schema_to_field(schema, Some(""), false)?),
+        schema => schema_fields.push(converter.field(schema, Some(""), false, None)?),
     }
 
     let schema = Schema::new(schema_fields);
     Ok(schema)
 }
 
-fn schema_to_field(
-    schema: &apache_avro::Schema,
-    name: Option<&str>,
-    nullable: bool,
-) -> Result<Field> {
-    schema_to_field_with_props(schema, name, nullable, Default::default())
-}
-
 /// Arrow's conventional name for a map's entry struct, and what the parquet
 /// reader produces — the two schemas have to agree by name to reconcile.
 pub(crate) const MAP_ENTRIES_FIELD: &str = "key_value";
 
-fn schema_to_field_with_props(
-    schema: &AvroSchema,
-    name: Option<&str>,
-    nullable: bool,
-    props: Option<HashMap<String, String>>,
-) -> Result<Field> {
-    let mut nullable = nullable;
-    let field_type: DataType = match schema {
-        AvroSchema::Ref { .. } => todo!("Add support for AvroSchema::Ref"),
-        AvroSchema::Null => DataType::Null,
-        AvroSchema::Boolean => DataType::Boolean,
-        AvroSchema::Int => DataType::Int32,
-        AvroSchema::Long => DataType::Int64,
-        AvroSchema::Float => DataType::Float32,
-        AvroSchema::Double => DataType::Float64,
-        AvroSchema::Bytes => DataType::Binary,
-        AvroSchema::String => DataType::Utf8,
-        AvroSchema::Array(item_schema) => DataType::List(Arc::new(schema_to_field_with_props(
-            &item_schema.items,
-            Some("element"),
-            false,
-            None,
-        )?)),
-        AvroSchema::Map(value_schema) => {
-            // An Arrow dictionary key must be an integer, so the `Dictionary(Utf8, V)`
-            // this used to produce was not a valid type and could not reconcile
-            // against the `Map` a parquet base file carries. Avro map keys are
-            // always strings, and the entry struct is never null.
-            let value_field =
-                schema_to_field_with_props(&value_schema.types, Some("value"), true, None)?;
-            let entries = Field::new(
-                MAP_ENTRIES_FIELD,
-                DataType::Struct(
-                    vec![Field::new("key", DataType::Utf8, false), value_field].into(),
-                ),
-                false,
-            );
-            DataType::Map(Arc::new(entries), false)
-        }
-        AvroSchema::Union(us) => {
-            // If there are only two variants and one of them is null, set the other type as the field data type
-            let has_nullable = us
-                .find_schema_with_known_schemata::<apache_avro::Schema>(&Value::Null, None, &None)
-                .is_some();
-            let sub_schemas = us.variants();
-            if has_nullable && sub_schemas.len() == 2 {
-                nullable = true;
-                if let Some(schema) = sub_schemas
-                    .iter()
-                    .find(|&schema| !matches!(schema, AvroSchema::Null))
-                {
-                    schema_to_field_with_props(schema, None, has_nullable, None)?
-                        .data_type()
-                        .clone()
-                } else {
-                    return Err(apache_avro::Error::new(
-                        apache_avro::error::Details::GetUnionDuplicate,
-                    )
-                    .into());
+struct SchemaConverter<'a> {
+    names: &'a NamesRef<'a>,
+    resolving: HashSet<Name>,
+}
+
+impl SchemaConverter<'_> {
+    fn field(
+        &mut self,
+        schema: &AvroSchema,
+        name: Option<&str>,
+        nullable: bool,
+        props: Option<HashMap<String, String>>,
+    ) -> Result<Field> {
+        let mut nullable = nullable;
+        let field_type: DataType = match schema {
+            AvroSchema::Ref { name: reference } => {
+                let referred = self.names.get(reference).ok_or_else(|| {
+                    CoreError::Schema(format!("Unknown Avro schema reference '{reference}'"))
+                })?;
+                if !self.resolving.insert(reference.clone()) {
+                    return Err(CoreError::Unsupported(format!(
+                        "Recursive Avro schema '{reference}' cannot be represented as Arrow"
+                    )));
                 }
-            } else {
-                let fields = sub_schemas
-                    .iter()
-                    .map(|s| schema_to_field_with_props(s, None, has_nullable, None))
-                    .collect::<Result<Vec<Field>>>()?;
-                let type_ids = 0_i8..fields.len() as i8;
-                DataType::Union(UnionFields::try_new(type_ids, fields)?, UnionMode::Dense)
+                let field = self.field(referred, name, nullable, props);
+                self.resolving.remove(reference);
+                return field;
             }
-        }
-        AvroSchema::Record(RecordSchema { fields, .. }) => {
-            let fields: Result<_> = fields
-                .iter()
-                .map(|field| {
-                    let mut props = HashMap::new();
-                    if let Some(doc) = &field.doc {
-                        props.insert("avro::doc".to_string(), doc.clone());
-                    }
-                    /*if let Some(aliases) = fields.aliases {
-                        props.insert("aliases", aliases);
-                    }*/
-                    schema_to_field_with_props(
-                        &field.schema,
-                        Some(&field.name),
-                        field.is_nullable(),
-                        Some(props),
+            AvroSchema::Null => DataType::Null,
+            AvroSchema::Boolean => DataType::Boolean,
+            AvroSchema::Int => DataType::Int32,
+            AvroSchema::Long => DataType::Int64,
+            AvroSchema::Float => DataType::Float32,
+            AvroSchema::Double => DataType::Float64,
+            AvroSchema::Bytes => DataType::Binary,
+            AvroSchema::String => DataType::Utf8,
+            AvroSchema::Array(item_schema) => DataType::List(Arc::new(self.field(
+                &item_schema.items,
+                Some("element"),
+                false,
+                None,
+            )?)),
+            AvroSchema::Map(value_schema) => {
+                // An Arrow dictionary key must be an integer, so the `Dictionary(Utf8, V)`
+                // this used to produce was not a valid type and could not reconcile
+                // against the `Map` a parquet base file carries. Avro map keys are
+                // always strings, and the entry struct is never null.
+                let value_field = self.field(&value_schema.types, Some("value"), true, None)?;
+                let entries = Field::new(
+                    MAP_ENTRIES_FIELD,
+                    DataType::Struct(
+                        vec![Field::new("key", DataType::Utf8, false), value_field].into(),
+                    ),
+                    false,
+                );
+                DataType::Map(Arc::new(entries), false)
+            }
+            AvroSchema::Union(us) => {
+                // If there are only two variants and one of them is null, set the other type as the field data type
+                let has_nullable = us
+                    .find_schema_with_known_schemata::<apache_avro::Schema>(
+                        &Value::Null,
+                        None,
+                        &None,
                     )
-                })
-                .collect();
-            DataType::Struct(fields?)
-        }
-        AvroSchema::Enum(EnumSchema { .. }) => DataType::Utf8,
-        AvroSchema::Fixed(FixedSchema { size, .. }) => DataType::FixedSizeBinary(*size as i32),
-        AvroSchema::Decimal(DecimalSchema {
-            precision, scale, ..
-        }) => DataType::Decimal128(*precision as u8, *scale as i8),
-        AvroSchema::BigDecimal => DataType::LargeBinary,
-        AvroSchema::Uuid => DataType::FixedSizeBinary(16),
-        AvroSchema::Date => DataType::Date32,
-        AvroSchema::TimeMillis => DataType::Time32(TimeUnit::Millisecond),
-        AvroSchema::TimeMicros => DataType::Time64(TimeUnit::Microsecond),
-        // Avro's `timestamp-*` logical types are instants in UTC; the
-        // timezone-naive variants are `local-timestamp-*` below. Carrying the
-        // zone matters beyond correctness: a parquet base file reads back as
-        // `Timestamp(_, "UTC")`, so dropping it here makes a log batch fail to
-        // concatenate with the base batch it is merged against.
-        AvroSchema::TimestampMillis => {
-            DataType::Timestamp(TimeUnit::Millisecond, Some(UTC_TIMEZONE.into()))
-        }
-        AvroSchema::TimestampMicros => {
-            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIMEZONE.into()))
-        }
-        AvroSchema::TimestampNanos => {
-            DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIMEZONE.into()))
-        }
-        AvroSchema::LocalTimestampMillis => todo!(),
-        AvroSchema::LocalTimestampMicros => todo!(),
-        AvroSchema::LocalTimestampNanos => todo!(),
-        AvroSchema::Duration => DataType::Duration(TimeUnit::Millisecond),
-    };
+                    .is_some();
+                let sub_schemas = us.variants();
+                if has_nullable && sub_schemas.len() == 2 {
+                    nullable = true;
+                    if let Some(schema) = sub_schemas
+                        .iter()
+                        .find(|&schema| !matches!(schema, AvroSchema::Null))
+                    {
+                        return self.field(schema, name, true, props);
+                    } else {
+                        return Err(apache_avro::Error::new(
+                            apache_avro::error::Details::GetUnionDuplicate,
+                        )
+                        .into());
+                    }
+                } else {
+                    let fields = sub_schemas
+                        .iter()
+                        .map(|s| self.field(s, None, has_nullable, None))
+                        .collect::<Result<Vec<Field>>>()?;
+                    let type_ids = 0_i8..fields.len() as i8;
+                    DataType::Union(UnionFields::try_new(type_ids, fields)?, UnionMode::Dense)
+                }
+            }
+            AvroSchema::Record(RecordSchema { fields, .. }) => {
+                let fields: Result<_> = fields
+                    .iter()
+                    .map(|field| {
+                        let mut props = HashMap::new();
+                        if let Some(doc) = &field.doc {
+                            props.insert("avro::doc".to_string(), doc.clone());
+                        }
+                        /*if let Some(aliases) = fields.aliases {
+                            props.insert("aliases", aliases);
+                        }*/
+                        self.field(
+                            &field.schema,
+                            Some(&field.name),
+                            field.is_nullable(),
+                            Some(props),
+                        )
+                    })
+                    .collect();
+                DataType::Struct(fields?)
+            }
+            AvroSchema::Enum(EnumSchema { .. }) => DataType::Utf8,
+            AvroSchema::Fixed(FixedSchema { size, .. }) => DataType::FixedSizeBinary(*size as i32),
+            AvroSchema::Decimal(DecimalSchema {
+                precision, scale, ..
+            }) => DataType::Decimal128(*precision as u8, *scale as i8),
+            AvroSchema::BigDecimal => DataType::LargeBinary,
+            AvroSchema::Uuid => DataType::FixedSizeBinary(16),
+            AvroSchema::Date => DataType::Date32,
+            AvroSchema::TimeMillis => DataType::Time32(TimeUnit::Millisecond),
+            AvroSchema::TimeMicros => DataType::Time64(TimeUnit::Microsecond),
+            // Avro's `timestamp-*` logical types are instants in UTC; the
+            // timezone-naive variants are `local-timestamp-*` below. Carrying the
+            // zone matters beyond correctness: a parquet base file reads back as
+            // `Timestamp(_, "UTC")`, so dropping it here makes a log batch fail to
+            // concatenate with the base batch it is merged against.
+            AvroSchema::TimestampMillis => {
+                DataType::Timestamp(TimeUnit::Millisecond, Some(UTC_TIMEZONE.into()))
+            }
+            AvroSchema::TimestampMicros => {
+                DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIMEZONE.into()))
+            }
+            AvroSchema::TimestampNanos => {
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIMEZONE.into()))
+            }
+            AvroSchema::LocalTimestampMillis => todo!(),
+            AvroSchema::LocalTimestampMicros => todo!(),
+            AvroSchema::LocalTimestampNanos => todo!(),
+            AvroSchema::Duration => DataType::Duration(TimeUnit::Millisecond),
+        };
 
-    let data_type = field_type.clone();
-    let name = name.unwrap_or_else(|| default_field_name(&data_type));
+        let data_type = field_type.clone();
+        let name = name.unwrap_or_else(|| default_field_name(&data_type));
 
-    let mut field = Field::new(name, field_type, nullable);
-    field.set_metadata(props.unwrap_or_default());
-    if is_hudi_variant_schema(schema) {
-        validate_hudi_variant_field(&field)?;
-        field.try_with_extension_type(VariantType)?;
+        let mut field = Field::new(name, field_type, nullable);
+        field.set_metadata(props.unwrap_or_default());
+        if is_hudi_variant_schema(schema) {
+            validate_hudi_variant_field(&field)?;
+            field.try_with_extension_type(VariantType)?;
+        }
+        Ok(field)
     }
-    Ok(field)
 }
 
 fn is_hudi_variant_schema(schema: &AvroSchema) -> bool {
@@ -554,5 +573,46 @@ mod tests {
 
         let err = to_arrow_schema(&schema).unwrap_err();
         assert!(err.to_string().contains("must have binary 'value'"));
+    }
+    #[test]
+    fn test_variant_references_preserve_extensions_in_nullable_containers() {
+        let avro = AvroSchema::parse_str(r#"{
+            "type":"record","name":"root","namespace":"example","fields":[
+              {"name":"v","type":["null",{"type":"record","name":"Variant","logicalType":"variant","fields":[
+                {"name":"value","type":"bytes"},{"name":"metadata","type":"bytes"}]}]},
+              {"name":"items","type":{"type":"array","items":["null","example.Variant"]}},
+              {"name":"attributes","type":{"type":"map","values":"example.Variant"}},
+              {"name":"ordinary","type":{"type":"record","name":"ordinary","fields":[
+                {"name":"metadata","type":"bytes"},{"name":"value","type":"bytes"}]}}
+            ]}"#).unwrap();
+        let schema = to_arrow_schema(&avro).unwrap();
+        schema.field(0).try_extension_type::<VariantType>().unwrap();
+        let DataType::List(element) = schema.field(1).data_type() else {
+            panic!("expected list")
+        };
+        assert!(element.is_nullable());
+        element.try_extension_type::<VariantType>().unwrap();
+        let DataType::Map(entries, _) = schema.field(2).data_type() else {
+            panic!("expected map")
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected entries")
+        };
+        fields[1].try_extension_type::<VariantType>().unwrap();
+        assert!(schema.field(3).try_extension_type::<VariantType>().is_err());
+    }
+
+    #[test]
+    fn test_recursive_avro_reference_returns_error() {
+        let schema = AvroSchema::parse_str(
+            r#"{"type":"record","name":"node","fields":[{"name":"next","type":["null","node"]}]}"#,
+        )
+        .unwrap();
+        assert!(
+            to_arrow_schema(&schema)
+                .unwrap_err()
+                .to_string()
+                .contains("Recursive Avro schema")
+        );
     }
 }

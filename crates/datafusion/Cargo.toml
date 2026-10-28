@@ -70,3 +70,4 @@ log = { workspace = true }
 [dev-dependencies]
 hudi-test = { path = "../test", features = ["datafusion"] }
 parquet = { workspace = true }
+serde_json = { workspace = true }
