@@ -94,6 +94,7 @@ pub(crate) mod fs_view;
 mod listing;
 pub mod partition;
 mod validation;
+pub mod writer;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
 

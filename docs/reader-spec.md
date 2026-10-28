@@ -21,7 +21,7 @@
 
 The public reader APIs hudi-rs exposes for Apache Hudi tables: the methods callers can call, the options they accept, and what callers can expect back.
 
-For tutorials and end-to-end examples, see the [README](../README.md). Covers Rust core (`hudi`) and the Python bindings (`hudi`); writer APIs, DataFusion, and C++ bindings are out of scope here.
+For tutorials and end-to-end examples, see the [README](../README.md). Native COW append is documented in the [writer spec](writer-spec.md). Covers Rust core (`hudi`) and the Python bindings (`hudi`); writer APIs, DataFusion, and C++ bindings are out of scope here.
 
 ## Contents
 
