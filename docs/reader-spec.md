@@ -346,3 +346,17 @@ For I/O cost estimation (on-disk base + log file sizes), use `FileSlice::total_s
 `Table` / `HudiTable` stores table configs (`HudiTableConfig`) and those read configs whose scope is `TableOrRead`; a per-read value overrides them. `ReadOnly` read configs — `hoodie.read.query.type` and the as-of/start/end timestamps — are filtered out during construction and flow exclusively through `ReadOptions` / `HudiReadOptions` per-call, so `hudi_options()` on the table never reflects them.
 
 Out of scope for this version: writer APIs, internal architecture (timeline parsing, log-record merging, metadata table layout), the full configuration key glossary (`HudiReadConfig` / `HudiTableConfig` members), and the DataFusion and C++ bindings — separate spec follow-ups.
+
+## Variant columns
+
+Variant columns use Arrow Struct storage with the `arrow.parquet.variant`
+extension metadata. Unshredded Hudi Variant values are preserved through COW and
+MOR reads, projections and the Arrow bindings. Consumers can use
+`parquet::variant::VariantArray::try_new` to decode values by child name; Hudi
+producers may order `value` and `metadata` differently. SQL null and an encoded
+Variant null remain distinct.
+
+Variant scans use the Hudi file-group reader in DataFusion. Shredded values are
+currently rejected before schema projection can discard `typed_value`. Variant
+comparisons are not advertised as pushdown predicates; queries on ordinary
+columns of the same table continue to work.

@@ -33,6 +33,7 @@ use zip::ZipArchive;
 pub mod gold;
 pub mod gold_options;
 pub mod util;
+pub mod variant;
 
 #[cfg(feature = "datafusion")]
 pub mod v9_verification;

@@ -28,6 +28,7 @@ pub mod delete;
 pub mod extended_promotion;
 pub mod parquet_list_norm;
 pub mod resolver;
+pub mod variant;
 
 pub fn prepend_meta_fields(schema: SchemaRef) -> Result<Schema> {
     let meta_field_schema = MetaField::schema();
