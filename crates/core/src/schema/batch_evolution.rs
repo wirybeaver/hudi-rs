@@ -280,14 +280,19 @@ pub(crate) fn is_promotion(from: &DataType, to: &DataType) -> bool {
 }
 
 pub(crate) fn evolve_array(src: &ArrayRef, target_field: &FieldRef) -> Result<ArrayRef> {
-    // Generic Struct projection would silently drop the shredded payload.
+    // Typed children must be folded into the residual before Struct projection.
     if target_field.has_valid_extension_type::<parquet::variant::VariantType>()
         && matches!(src.data_type(), DataType::Struct(fields) if fields.iter().any(|f| f.name() == "typed_value"))
     {
-        return Err(CoreError::Unsupported(format!(
-            "Shredded Variant field '{}' requires reconstruction before projection",
-            target_field.name()
-        )));
+        let array = parquet::variant::VariantArray::try_new(src)?;
+        let unshredded = parquet::variant::unshred_variant(&array).map_err(|e| {
+            CoreError::Schema(format!(
+                "Failed to reconstruct Variant '{}': {e}",
+                target_field.name()
+            ))
+        })?;
+        let unshredded: ArrayRef = Arc::new(unshredded.into_inner());
+        return evolve_array(&unshredded, target_field);
     }
     let st = src.data_type();
     let tt = target_field.data_type();

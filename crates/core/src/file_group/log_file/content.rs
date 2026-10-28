@@ -328,10 +328,11 @@ impl Decoder {
             Some(required_json) => {
                 let writer = apache_avro::Schema::parse_str(writer_schema_json)?;
                 let required = apache_avro::Schema::parse_str(required_json)?;
-                if record_needs_rewrite_for_extended_promotion(&writer, &required)? {
+                if crate::schema::variant::has_shredded_variant(&writer)
+                    || record_needs_rewrite_for_extended_promotion(&writer, &required)?
+                {
                     log::warn!(
-                        "log block rewritten rather than resolved: its schema differs from the \
-                         table's in a way Avro does not define a promotion for"
+                        "log block decoded at its writer schema before reconstruction and evolution"
                     );
                     let target = avro_json_to_arrow_schema(required_json)?;
                     (None, Some(Arc::new(target)))
@@ -660,6 +661,50 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use std::io::{BufReader, Cursor};
     use std::sync::Arc;
+
+    #[test]
+    fn test_shredded_variant_log_reconstructs_before_reader_resolution() -> Result<()> {
+        use parquet::variant::{VariantArray, VariantType};
+        let writer_json = r#"{"type":"record","name":"root","fields":[{"name":"v","type":{"type":"record","name":"v","logicalType":"variant","fields":[{"name":"metadata","type":"bytes"},{"name":"value","type":["null","bytes"]},{"name":"typed_value","type":["null","long"]}]}}]}"#;
+        let required_json = r#"{"type":"record","name":"root","fields":[{"name":"v","type":{"type":"record","name":"v","logicalType":"variant","fields":[{"name":"metadata","type":"bytes"},{"name":"value","type":["null","bytes"]}]}}]}"#;
+        let writer = apache_avro::Schema::parse_str(writer_json)?;
+        let datum = AvroValue::Record(vec![(
+            "v".into(),
+            AvroValue::Record(vec![
+                ("metadata".into(), AvroValue::Bytes(vec![1, 0, 0])),
+                (
+                    "value".into(),
+                    AvroValue::Union(0, Box::new(AvroValue::Null)),
+                ),
+                (
+                    "typed_value".into(),
+                    AvroValue::Union(1, Box::new(AvroValue::Long(42))),
+                ),
+            ]),
+        )]);
+        let body = to_avro_datum(&writer, datum)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buf.extend(body);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .with_reader_schema(Some(required_json.into()));
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.into())]);
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+        let batch = &batches.data_batches[0];
+        batch
+            .schema()
+            .field(0)
+            .try_extension_type::<VariantType>()?;
+        assert_eq!(
+            VariantArray::try_new(batch.column(0))?
+                .try_value(0)?
+                .as_int64(),
+            Some(42)
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_decode_avro_content() -> Result<()> {

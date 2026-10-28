@@ -67,7 +67,7 @@ async fn test_spark_variant_tables_snapshot_time_travel_and_projection() {
 }
 
 #[tokio::test]
-async fn test_shredded_variant_is_rejected_before_projection() {
+async fn test_mixed_spark_variants_reconstruct_before_projection() {
     use arrow_schema::{DataType, Schema};
     use hudi_core::file_group::base_file::parquet::ParquetBaseFileReader;
     use hudi_core::file_group::base_file::reader::{BaseFileReadOptions, BaseFileReader};
@@ -84,7 +84,8 @@ async fn test_shredded_variant_is_rejected_before_projection() {
     )
     .unwrap();
     let reader = ParquetBaseFileReader::new(storage);
-    let mut rejected = false;
+    let mut reconstructed = Vec::new();
+    let mut shredded_files = 0;
     for entry in std::fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|s| s != "parquet") {
@@ -101,9 +102,7 @@ async fn test_shredded_variant_is_rejected_before_projection() {
         let DataType::Struct(fields) = schema.field_with_name("v").unwrap().data_type() else {
             panic!("variant must be a struct")
         };
-        if !fields.iter().any(|f| f.name() == "typed_value") {
-            continue;
-        }
+        shredded_files += usize::from(fields.iter().any(|f| f.name() == "typed_value"));
         let logical: arrow_schema::Fields = fields
             .iter()
             .filter(|f| f.name() != "typed_value")
@@ -127,14 +126,16 @@ async fn test_shredded_variant_is_rejected_before_projection() {
                 })
                 .collect::<Vec<_>>(),
         ));
-        let error = project_batch_to_schema(&batch, &target).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("requires reconstruction before projection"),
-            "{error}"
-        );
-        rejected = true;
+        reconstructed.push(project_batch_to_schema(&batch, &target).unwrap());
     }
-    assert!(rejected, "fixture must exercise a shredded file");
+    assert_eq!(shredded_files, 1);
+    assert_eq!(
+        variant_rows(&reconstructed),
+        vec![
+            (1, json!({"key":"k1"})),
+            (2, json!({"key":"k2"})),
+            (3, json!({"key":3})),
+            (4, json!({"key":"k4"})),
+        ]
+    );
 }
