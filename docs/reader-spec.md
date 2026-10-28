@@ -357,6 +357,7 @@ producers may order `value` and `metadata` differently. SQL null and an encoded
 Variant null remain distinct.
 
 Variant scans use the Hudi file-group reader in DataFusion. Shredded values are
-currently rejected before schema projection can discard `typed_value`. Variant
+reconstructed with Arrow before schema projection, including typed/residual
+fallback and incompatible physical layouts across files. Variant
 comparisons are not advertised as pushdown predicates; queries on ordinary
 columns of the same table continue to work.

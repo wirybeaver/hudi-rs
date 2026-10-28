@@ -90,6 +90,12 @@ fn narrow_array_to_field(
     source_field: &Field,
     target_field: &Field,
 ) -> Result<ArrayRef> {
+    if crate::schema::variant::contains_variant(target_field) {
+        return crate::schema::batch_evolution::evolve_array(
+            source,
+            &Arc::new(target_field.clone()),
+        );
+    }
     if source_field.data_type() == target_field.data_type() {
         return Ok(Arc::clone(source));
     }
