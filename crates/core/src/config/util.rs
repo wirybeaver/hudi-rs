@@ -76,11 +76,47 @@ pub fn parse_data_for_options(data: &Bytes, split_chars: &str) -> Result<HashMap
             )))?
             .trim()
             .to_owned();
-        let value = parts.next().unwrap_or("").trim().to_owned();
+        let value = unescape_property(parts.next().unwrap_or("").trim())
+            .map_err(|e| ParseLine(format!("Invalid property '{key}': {e}")))?;
         options.insert(key, value);
     }
 
     Ok(options)
+}
+
+// Java Properties.store escapes backslashes and non-ASCII text. Decoding at
+// the configuration layer preserves embedded JSON schemas and string defaults.
+fn unescape_property(value: &str) -> Result<String> {
+    let mut chars = value.chars();
+    let mut units = Vec::with_capacity(value.len());
+    while let Some(ch) = chars.next() {
+        let ch = if ch == '\\' {
+            match chars.next() {
+                Some('u') => {
+                    let digits: String = chars.by_ref().take(4).collect();
+                    if digits.len() != 4 {
+                        return Err(ParseLine("Incomplete Unicode escape".into()));
+                    }
+                    units.push(
+                        u16::from_str_radix(&digits, 16)
+                            .map_err(|e| ParseLine(format!("Invalid Unicode escape: {e}")))?,
+                    );
+                    continue;
+                }
+                Some('n') => '\n',
+                Some('r') => '\r',
+                Some('t') => '\t',
+                Some('f') => '\u{000c}',
+                Some(other) => other,
+                None => return Err(ParseLine("Incomplete property escape".into())),
+            }
+        } else {
+            ch
+        };
+        units.extend_from_slice(ch.encode_utf16(&mut [0; 2]));
+    }
+    String::from_utf16(&units)
+        .map_err(|e| ParseLine(format!("Invalid Unicode property value: {e}")))
 }
 
 #[cfg(test)]

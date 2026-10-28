@@ -46,6 +46,9 @@ pub fn variant_rows(batches: &[RecordBatch]) -> Vec<(i32, Value)> {
         let column = batch.column_by_name("v").unwrap();
         let variants = VariantArray::try_new(column).unwrap();
         for i in 0..variants.len() {
+            if variants.is_null(i) {
+                continue;
+            }
             variants
                 .try_value(i)
                 .unwrap_or_else(|e| panic!("{e}: {column:?}"));
